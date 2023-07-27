@@ -1,0 +1,253 @@
+module SP where
+
+import DA.Action   (when)
+import DA.Optional
+import DA.Time
+
+{- Feature 1: Solar Project Registry: Create a registry of approved community solar projects
+       that are available for investment.
+       This should include key project details such as
+         location,
+         capacity,
+         and estimated annual energy production. -}
+
+type SolarPrjId = ContractId SolarPrj
+
+data Currency = UAH | PLN | EUR | CHF | USD deriving (Eq, Show)
+data ProjectStage = Initiated | Tokenized | Investment_Failed | Stopped  deriving (Eq, Show) -- Initiated when approved, Tokenized when all tokens are sold (investments collected then, owner /= issuer) before deadline date, Investment_Failed when after the dealine date issuer tokenBalance > 0, Stopped when not operating (doesn't generate Revenue)
+
+data SPInfo = SPInfo with
+  projectName : Text
+  projectDesc : Text
+  investmentAmount    : Decimal
+  investmentCurrency  : Currency
+  investmentDeadlineTime  : Optional Time
+  location    : Text
+  capacity    : Decimal -- maximum power output of solar prj, Watts
+  estAnnualEnergyProduction  : Decimal -- kWh, kilowatt-hours
+    deriving (Eq, Show)
+
+class Timespan i t o where
+  daysTillDeadline : i -> t -> o
+
+instance Timespan SPInfo Time Int where
+  daysTillDeadline prjInf momentFrom = wholeDays $ subTime (fromSome prjInf.investmentDeadlineTime) momentFrom
+
+
+template SolarPrj
+  with
+    initiator   : Party
+    approver    : Party --approve a project to be in the Registry
+    community   : [Party]
+    spInfo      : SPInfo
+    projectStage : ProjectStage
+    initDateTime : Time --suppposed to be timestamp of project initiation
+  where
+    signatory initiator, approver
+    observer community
+
+    key (initiator, spInfo.projectName) : (Party, Text)
+    maintainer key._1
+
+    nonconsuming choice TokenizeSP : SPTokenLotId
+      with
+        tokenBalance       : Decimal
+        lotId              : Text
+      controller initiator
+      do
+        assertMsg "Lot Id should not be empty" $ lotId /= "" 
+        create SPTokenLot with
+          tokenIssuer = initiator
+          tokenOwner = initiator
+          projectName = spInfo.projectName
+          tradeAllowed = True
+          ..
+
+    nonconsuming choice ProjectTokenLotsDetails : [Text]
+        with
+          tokenLots : [(ContractId SPTokenLot, SPTokenLot)]
+      controller initiator
+      do
+        if null tokenLots then return ["no token lots"]
+          else do
+            return $ map (\tl -> tl._2.projectName <> " - " <> tl._2.lotId <> " : " <> show tl._2.tokenBalance) tokenLots
+
+template SPMaster
+  with
+    initiator: Party
+  where
+    signatory initiator
+
+    nonconsuming choice InitiateSP : ContractId SolarPrjProposal
+      with
+        approver: Party
+        spInfo      : SPInfo
+        community : [Party]
+      controller initiator
+      do
+        initDateTime <- getTime
+        create SolarPrjProposal
+            with ..
+
+--the initiate/accept pattern moves the workflow forward
+
+template SolarPrjProposal
+  with
+    initiator   : Party
+    approver    : Party --approve a project to be in the Registry
+    community   : [Party]
+    spInfo      : SPInfo
+  where
+    signatory initiator
+    observer approver
+
+    ensure approver /= initiator
+      && spInfo.projectName /= ""
+      && spInfo.location /= ""
+      && spInfo.investmentAmount > 0.00
+      && spInfo.capacity > 0.00
+      && spInfo.estAnnualEnergyProduction > 0.00
+
+    choice ReviewSPProposal : SolarPrjId
+      controller approver
+      do
+        initDateTime <- getTime
+
+        if isSome spInfo.investmentDeadlineTime then do
+            let daysForInvestment = daysTillDeadline spInfo initDateTime
+            assertMsg "Project should have at least 30 days for investment" $ daysForInvestment > 29
+            else pure ()
+
+        create SolarPrj with
+          projectStage = Initiated
+          ..
+    
+    choice RejectSPProposal : ()
+      controller approver
+      do
+        pure ()
+
+{- Feature 2: Tokenization: Develop a smart contract-based system for tokenizing each solar project,
+    with each token representing a share of the project’s ownership. -}
+
+type SPTokenLotId = ContractId SPTokenLot
+
+template SPTokenLot
+  with
+    tokenIssuer        : Party
+    tokenOwner         : Party
+    projectName        : Text
+    tokenBalance       : Decimal -- or tokenAmount
+    tradeAllowed       : Bool
+    lotId              : Text
+  where
+    signatory tokenIssuer, tokenOwner
+
+    key (tokenOwner, projectName, lotId) : (Party, Text, Text)
+    maintainer key._1
+
+    ensure tokenBalance > 0.0
+
+    choice Transfer : Either SPTokenLotId (SPTokenLotId, SPTokenLotId)
+      with
+        newTokenOwner : Party
+        transferAmount : Decimal
+      controller tokenOwner
+        do
+          assertMsg "Token lot balance exceeded" $ tokenBalance >= transferAmount
+          assertMsg "Current and new owners should differ" $ tokenOwner /= newTokenOwner
+          assertMsg "Trade should be allowed in order to make Transfer" $ tradeAllowed
+          xferredLot <- create this with
+              tokenOwner = newTokenOwner
+              tokenBalance = transferAmount
+          let transferRemainder = tokenBalance - transferAmount
+          if transferRemainder > 0.0 then do
+              remainderLot <- create this with
+                tokenBalance = transferRemainder
+              return $ Right (xferredLot, remainderLot)
+            else
+              return $ Left (xferredLot)
+    
+    choice Offer : Either SPTokenSupplyOfferId (SPTokenSupplyOfferId, SPTokenLotId)
+      with
+        community          : [Party]
+        offerAmount        : Decimal
+        offerLotPrice      : Decimal -- total price for all tokens in offer
+        tokenLotPriceCurrency : Currency
+      controller tokenOwner
+      do 
+        assertMsg "Token lot balance exceeded" $ tokenBalance >= offerAmount
+        assertMsg "You can't offer to yourself" $ notElem tokenOwner community
+        assertMsg "Trade isn't allowed" $ tradeAllowed
+        when (tokenOwner == tokenIssuer) (do
+          (_, sp) <- fetchByKey @SolarPrj (tokenIssuer, projectName)
+          case sp.projectStage of
+            Initiated -> assertMsg "Offer lot price currency should match project investment currency during initial offering/fund raising" $ tokenLotPriceCurrency == sp.spInfo.investmentCurrency
+            _ -> pure())
+        offeredLot <- create SPTokenSupplyOffer with
+          tokenSeller = tokenOwner
+          tokenAmount = offerAmount
+          tokenLotPrice = offerLotPrice
+          ..
+        let offerRemainder = tokenBalance - offerAmount
+        if offerRemainder > 0.0 then do
+            remainderLot <- create this with
+              tokenBalance = offerRemainder
+              lotId = lotId <> "-r"
+            return $ Right (offeredLot, remainderLot)
+          else
+            return $ Left (offeredLot)
+      
+    choice InvertTradePermission : SPTokenLotId
+      controller tokenIssuer
+      do create this with
+                tradeAllowed = not tradeAllowed
+    
+    choice BurnTokenLot : ()
+      controller tokenIssuer, tokenOwner
+      do
+        pure ()
+
+{- Feature 3: Trading Platform: Implement
+                        - decentralized trading platform that enables
+                        - the exchange of solar energy tokens between community members. -}
+
+type SPTokenSupplyOfferId = ContractId SPTokenSupplyOffer
+
+template SPTokenSupplyOffer -- or Token offers (proposals to buy) from owners/sellers
+  with
+    tokenSeller        : Party
+    community          : [Party]
+    projectName        : Text
+    lotId              : Text
+    tokenAmount        : Decimal
+    tokenLotPrice      : Decimal -- total price for all tokens in offer
+    tokenLotPriceCurrency : Currency --could be either prjName Currency
+  where
+    signatory tokenSeller
+    observer community
+    ensure tokenLotPrice > 0.00
+      && notElem tokenSeller community
+
+    choice Accept : SPTokenLotId
+      with
+        buyer : Party
+      controller buyer, tokenSeller
+      do
+        assert $ elem buyer community
+        acceptedTokenLot <- create SPTokenLot with
+            tokenIssuer = buyer
+            tokenOwner = buyer
+            tokenBalance = tokenAmount
+            tradeAllowed = True
+            lotId = "trade" <> lotId
+            ..
+        return (acceptedTokenLot)
+
+    choice UpdOffer : SPTokenSupplyOfferId
+      with
+        community  : [Party]
+        tokenLotPrice : Decimal
+        tokenLotPriceCurrency : Currency
+      controller tokenSeller
+      do create this with

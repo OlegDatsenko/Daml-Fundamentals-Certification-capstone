@@ -1,0 +1,176 @@
+module Main where
+
+import SP
+
+import DA.Date        (date)
+import DA.Date.Types  (Month(..))
+import DA.Time        (time)
+
+import Daml.Script
+
+-- import DA.Time
+
+data TestParties = TestParties with
+  alice : Party
+  bob : Party
+  charlie : Party
+
+setupTestParties = script do
+    alice <- allocatePartyWithHint "Alice" (PartyIdHint "Alice")
+    bob <- allocatePartyWithHint "Bob" (PartyIdHint "Bob")
+    charlie <- allocatePartyWithHint "Charlie" (PartyIdHint "Charlie")
+
+    return TestParties with ..
+
+setupTestUsers = script do
+  testParties@TestParties{..} <- setupTestParties
+  
+  aliceId <- validateUserId "alice"
+  bobId <- validateUserId "bob"
+  charlieId <- validateUserId "charlie"
+  createUser (User aliceId (Some alice)) [CanActAs alice]
+  createUser (User bobId (Some bob)) [CanActAs bob]
+  createUser (User charlieId (Some charlie)) [CanActAs charlie]
+
+  submit alice do createCmd SPMaster with initiator = alice
+  submit bob do createCmd SPMaster with initiator = bob
+  submit charlie do createCmd SPMaster with initiator = charlie
+
+  return ()
+
+
+data TestSolarProjectInfos = TestSolarProjectInfos with
+    spInfoPL1: SPInfo
+    spInfoUA2: SPInfo
+    spInfoHR3: SPInfo
+
+setupSPInfos = script do
+
+  testParties@TestParties{..} <- setupTestParties
+
+  let spInfoPL1 = SPInfo with
+          projectName = "Ever Bright PL"
+          projectDesc = "EVBPL"
+          location = "PL05800"
+          capacity = 30000.00
+          estAnnualEnergyProduction = 500000.00
+          investmentAmount = 250000.00
+          investmentCurrency = PLN
+          investmentDeadlineTime = Some $ time (date 2023 Aug 3) 0 0 0
+
+      spInfoUA2 = SPInfo with
+          projectName = "Never Give Up UA"
+          projectDesc = "NGUUA"
+          location = "UA08300"
+          capacity = 45000.00
+          estAnnualEnergyProduction = 650000.00
+          investmentAmount = 48000000.00
+          investmentCurrency = UAH
+          investmentDeadlineTime = None
+
+      spInfoHR3 = SPInfo with
+          projectName = "Osijek Solar Energy"
+          projectDesc = ""
+          location = "HR31000"
+          capacity = 85000.00
+          estAnnualEnergyProduction = 1150000.00
+          investmentAmount = 100000.00
+          investmentCurrency = EUR
+          investmentDeadlineTime = Some $ time (date 2023 Sep 30) 0 0 0
+
+  return (testParties, TestSolarProjectInfos with {spInfoPL1, spInfoUA2, spInfoHR3})
+
+setupSolarProjects = script do
+  (testParties@TestParties{..}, testSPInfos@TestSolarProjectInfos{..}) <- setupSPInfos
+
+  aliceSPProp <- submit alice do
+    createCmd SolarPrjProposal with
+          initiator = alice
+          approver = bob
+          community = [charlie]
+          spInfo = spInfoPL1
+  
+  aliceSP <- submit bob do
+    exerciseCmd aliceSPProp ReviewSPProposal
+
+  charlieSPProp <- submit charlie do
+    createCmd SolarPrjProposal with
+          initiator = charlie
+          approver = bob
+          community = [alice, bob]
+          spInfo = spInfoUA2
+
+  charlieSP <- submit bob do
+    exerciseCmd charlieSPProp ReviewSPProposal
+
+  bobSPProp <- submit bob do
+    createCmd SolarPrjProposal with
+          initiator = bob
+          approver = alice
+          community = []
+          spInfo = spInfoHR3
+
+  bobSP <- submit alice do
+    exerciseCmd bobSPProp ReviewSPProposal
+
+  return (testParties, aliceSP, charlieSP, bobSP)
+
+testTokenizeCharlieSP = script do
+  (testParties@TestParties{..}, _, charlieSP, _) <- setupSolarProjects
+  charlieSPTokenLot <- submit charlie do
+    exerciseCmd charlieSP TokenizeSP with
+      tokenBalance = 7000.0
+      lotId = "Test UA lot"
+  return (testParties, charlieSPTokenLot)
+
+testTokenizeAliceSPEmptyLotIdMustFail = script do
+  (testParties@TestParties{..}, aliceSP, _, _) <- setupSolarProjects
+  submitMustFail alice do
+    exerciseCmd aliceSP TokenizeSP with
+      tokenBalance = 100.0
+      lotId = ""
+  return ()
+
+testOfferCharlieSPTokenLot = script do
+  (testParties@TestParties{..}, charlieSPTokenLot) <- testTokenizeCharlieSP
+  Right (charlieSPTokenLotOffer1, charlieSPTokenRemainderLot) <- submit charlie do
+    exerciseCmd charlieSPTokenLot Offer with
+      community = [alice, bob]
+      offerAmount = 4000.0
+      offerLotPrice = 28000000.0
+      tokenLotPriceCurrency = UAH
+  Left charlieSPTokenLotOffer2 <- submit charlie do
+    exerciseCmd charlieSPTokenRemainderLot Offer with
+      community = [alice, bob]
+      offerAmount = 3000.0
+      offerLotPrice = 20000000.0
+      tokenLotPriceCurrency = UAH
+  return (testParties, charlieSPTokenLotOffer1, charlieSPTokenLotOffer2)
+
+testOfferCharlieSPTokenLotExceedBalanceMustFail = script do
+  (testParties@TestParties{..}, charlieSPTokenLot) <- testTokenizeCharlieSP
+  submitMustFail charlie do
+    exerciseCmd charlieSPTokenLot Offer with
+      community = [alice, bob]
+      offerAmount = 8000.0
+      offerLotPrice = 78000000.0
+      tokenLotPriceCurrency = UAH
+  return ()
+
+testSelfOfferCharlieSPTokenLotMustFail = script do
+  (testParties@TestParties{..}, charlieSPTokenLot) <- testTokenizeCharlieSP
+  submitMustFail charlie do
+    exerciseCmd charlieSPTokenLot Offer with
+      community = [alice, bob, charlie]
+      offerAmount = 6000.0
+      offerLotPrice = 78000000.0
+      tokenLotPriceCurrency = UAH
+  return ()
+
+testAcceptCharlieSPTokenLotOffer = script do
+  (testParties@TestParties{..}, charlieSPTokenLotOffer1, charlieSPTokenLotOffer2) <- testOfferCharlieSPTokenLot
+  acceptedAliceTokenLot <- submitMulti [alice, charlie] [] do
+    exerciseCmd charlieSPTokenLotOffer1 Accept with buyer = alice
+  acceptedBobTokenLot <- submitMulti [bob, charlie] [] do
+    exerciseCmd charlieSPTokenLotOffer2 Accept with buyer = bob
+  return (testParties, acceptedAliceTokenLot, acceptedBobTokenLot)

@@ -167,6 +167,15 @@ testSelfOfferCharlieSPTokenLotMustFail = script do
       tokenLotPriceCurrency = UAH
   return ()
 
+testUpdCharlieSPTokenLotOffer = script do
+  (testParties@TestParties{..}, charlieSPTokenLotOffer1, charlieSPTokenLotOffer2) <- testOfferCharlieSPTokenLot
+  updAliceCharlieTokenLot <- submit charlie do
+    exerciseCmd charlieSPTokenLotOffer1 UpdOffer with
+      newCommunity = [bob]
+      newTokenLotPrice = 123123.0
+      newTokenLotPriceCurrency = UAH
+  return (testParties, updAliceCharlieTokenLot)
+
 testAcceptCharlieSPTokenLotOffer = script do
   (testParties@TestParties{..}, charlieSPTokenLotOffer1, charlieSPTokenLotOffer2) <- testOfferCharlieSPTokenLot
   acceptedAliceTokenLot <- submitMulti [alice, charlie] [] do

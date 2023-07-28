@@ -246,8 +246,11 @@ template SPTokenSupplyOffer -- or Token offers (proposals to buy) from owners/se
 
     choice UpdOffer : SPTokenSupplyOfferId
       with
-        community  : [Party]
-        tokenLotPrice : Decimal
-        tokenLotPriceCurrency : Currency
+        newCommunity  : [Party]
+        newTokenLotPrice : Decimal
+        newTokenLotPriceCurrency : Currency
       controller tokenSeller
       do create this with
+          community = newCommunity
+          tokenLotPrice = newTokenLotPrice
+          tokenLotPriceCurrency = newTokenLotPriceCurrency
